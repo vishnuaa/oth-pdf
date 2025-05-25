@@ -1,6 +1,6 @@
 from flask import Flask, request, render_template, redirect, url_for, send_file
 import os
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, pdfinfo_from_path
 from PIL import Image, ImageDraw
 import uuid
 import fitz  # PyMuPDF
@@ -26,24 +26,23 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
+cleanup_thread_started = False
 
 def compress_pdf_to_range(input_path, output_path, target_min=4 * 1024 * 1024, target_max=5 * 1024 * 1024):
-    quality = 95
+    quality = 85
     step = 5
-    for _ in range(10):
-        # Open the PDF using fitz
-        doc = fitz.open(input_path)  # Ensure you're using the correct method to open the PDF
-
+    for _ in range(6):
+        doc = fitz.open(input_path)
         new_doc = fitz.open()
 
         for page in doc:
-            pix = page.get_pixmap(dpi=100)
+            pix = page.get_pixmap(dpi=72)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            img_path = f"temp_page_{uuid.uuid4().hex}.jpg"
-            img.save(img_path, "JPEG", quality=quality)
+            temp_img = f"temp_page_{uuid.uuid4().hex}.jpg"
+            img.save(temp_img, "JPEG", quality=quality)
             img_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
-            img_page.insert_image(page.rect, filename=img_path)
-            os.remove(img_path)
+            img_page.insert_image(page.rect, filename=temp_img)
+            os.remove(temp_img)
 
         new_doc.save(output_path)
         new_doc.close()
@@ -57,42 +56,35 @@ def compress_pdf_to_range(input_path, output_path, target_min=4 * 1024 * 1024, t
         else:
             break
 
-
-
 def process_pdf_images(image_paths, output_pdf_path):
     width, height = A4
     valid_images = []
 
     for img_path in image_paths:
-        img = Image.open(img_path)
-        extracted_text = pytesseract.image_to_string(img).lower()
-
-        valid_images.append(img_path)
+        with Image.open(img_path) as img:
+            _ = pytesseract.image_to_string(img).lower()
+            valid_images.append(img_path)
 
     if not valid_images:
         return None
 
     c = canvas.Canvas(output_pdf_path, pagesize=A4)
     for img_path in valid_images:
-        img = Image.open(img_path)
-        img_width, img_height = img.size
-
-        scale = min((width - 40) / img_width, (height - 100) / img_height)
-        new_width = int(img_width * scale)
-        new_height = int(img_height * scale)
-
-        x_position = (width - new_width) / 2
-        y_position = (height - new_height) / 2
-
-        c.drawImage(img_path, x_position, y_position, new_width, new_height)
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(20, 20, "Name of Agency & Address of Agency")
-        c.showPage()
-
+        with Image.open(img_path) as img:
+            img_width, img_height = img.size
+            scale = min((width - 40) / img_width, (height - 100) / img_height)
+            new_width = int(img_width * scale)
+            new_height = int(img_height * scale)
+            x = (width - new_width) / 2
+            y = (height - new_height) / 2
+            c.drawImage(img_path, x, y, new_width, new_height)
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(20, 20, "Name of Agency & Address of Agency")
+            c.showPage()
     c.save()
 
     size = os.path.getsize(output_pdf_path)
-    if size > 5 * 1024 * 1024:  # Only compress if the size is above 2MB
+    if size > 5 * 1024 * 1024:
         compressed_path = output_pdf_path.replace(".pdf", "_compressed.pdf")
         compress_pdf_to_range(output_pdf_path, compressed_path)
         if os.path.exists(compressed_path):
@@ -100,21 +92,27 @@ def process_pdf_images(image_paths, output_pdf_path):
 
     return output_pdf_path
 
+def clean_folders_once():
+    global cleanup_thread_started
+    if cleanup_thread_started:
+        return
+    cleanup_thread_started = True
 
-def clean_folders():
-    try:
-        time.sleep(60)  # wait for 1 minutes
+    def task():
+        time.sleep(60)
         for folder in [UPLOAD_FOLDER, IMAGE_FOLDER, OUTPUT_FOLDER]:
             for item in os.listdir(folder):
                 path = os.path.join(folder, item)
-                if os.path.isfile(path):
-                    os.remove(path)
-                else:
-                    shutil.rmtree(path, ignore_errors=True)
-        print("Cleaned folders after 2 minutes.")
-    except Exception as e:
-        print(f"Error cleaning folders: {e}")
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                    else:
+                        shutil.rmtree(path, ignore_errors=True)
+                except:
+                    pass
+        print("Cleaned folders after 1 minute.")
 
+    threading.Thread(target=task, daemon=True).start()
 
 @app.route('/')
 def index():
@@ -122,14 +120,13 @@ def index():
     for folder in os.listdir(IMAGE_FOLDER):
         folder_path = os.path.join(IMAGE_FOLDER, folder)
         if os.path.isdir(folder_path):
-            images = sorted([ 
+            images = sorted([
                 os.path.join(folder_path, img)
                 for img in os.listdir(folder_path)
                 if img.endswith('.png')
             ])
             pdf_images[folder] = images
     return render_template('index.html', pdf_images=pdf_images)
-
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -149,13 +146,15 @@ def upload_file():
             filepath = os.path.join(UPLOAD_FOLDER, filename)
             file.save(filepath)
 
-            images = convert_from_path(filepath)
-            for idx, img in enumerate(images):
-                img.thumbnail((500, 500))
-                img.save(os.path.join(save_dir, f"page_{idx}.png"), 'PNG')
+            info = pdfinfo_from_path(filepath)
+            for page_num in range(1, info["Pages"] + 1):
+                images = convert_from_path(filepath, first_page=page_num, last_page=page_num, dpi=100)
+                for img in images:
+                    img.thumbnail((500, 500))
+                    img.save(os.path.join(save_dir, f"page_{page_num}.png"), 'PNG')
+                    img.close()
 
     return redirect(url_for('index'))
-
 
 @app.route('/rename/<old_name>', methods=['POST'])
 def rename_folder(old_name):
@@ -178,16 +177,14 @@ def rename_folder(old_name):
 
     return "Original name not found", 404
 
-
 @app.route('/rotate/<folder>/<image_name>', methods=['POST'])
 def rotate_image(folder, image_name):
     image_path = os.path.join(IMAGE_FOLDER, folder, image_name)
     if os.path.exists(image_path):
-        img = Image.open(image_path)
-        img = img.rotate(90, expand=True)
-        img.save(image_path, 'PNG')
+        with Image.open(image_path) as img:
+            img = img.rotate(90, expand=True)
+            img.save(image_path, 'PNG')
     return redirect(url_for('index'))
-
 
 @app.route('/delete/<folder>/<image_name>', methods=['POST'])
 def delete_image(folder, image_name):
@@ -195,7 +192,6 @@ def delete_image(folder, image_name):
     if os.path.exists(image_path):
         os.remove(image_path)
     return redirect(url_for('index'))
-
 
 @app.route('/save_rectangle/<folder>/<image_name>', methods=['POST'])
 def save_rectangle(folder, image_name):
@@ -207,14 +203,13 @@ def save_rectangle(folder, image_name):
 
         image_path = os.path.join(IMAGE_FOLDER, folder, image_name)
         if os.path.exists(image_path):
-            img = Image.open(image_path)
-            draw = ImageDraw.Draw(img)
-            draw.rectangle([rect_x, rect_y, rect_x + rect_width, rect_y + rect_height], fill="blue")
-            img.save(image_path, 'PNG')
+            with Image.open(image_path) as img:
+                draw = ImageDraw.Draw(img)
+                draw.rectangle([rect_x, rect_y, rect_x + rect_width, rect_y + rect_height], fill="blue")
+                img.save(image_path, 'PNG')
         return redirect(url_for('index'))
     except Exception as e:
         return f"Error: {str(e)}", 500
-
 
 @app.route('/download_pdfs')
 def download_pdfs():
@@ -225,8 +220,10 @@ def download_pdfs():
         if not os.path.isdir(folder_path):
             continue
 
-        image_files = sorted([ 
-            os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith('.png')
+        image_files = sorted([
+            os.path.join(folder_path, f)
+            for f in os.listdir(folder_path)
+            if f.endswith('.png')
         ])
 
         output_filename = f"{folder} OTH.pdf"
@@ -236,11 +233,10 @@ def download_pdfs():
         if result:
             generated_files.append(result)
 
+    clean_folders_once()
+
     if not generated_files:
         return "No valid PDFs generated."
-
-    # Start cleanup timer
-    threading.Thread(target=clean_folders, daemon=True).start()
 
     if len(generated_files) == 1:
         return send_file(generated_files[0], as_attachment=True)
@@ -252,6 +248,5 @@ def download_pdfs():
 
     return send_file(zip_path, as_attachment=True)
 
-
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run()
